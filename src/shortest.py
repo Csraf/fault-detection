@@ -151,10 +151,14 @@ class ExampleShortestForwarding(app_manager.RyuApp):
         # reverse link.
         links = [(link.dst.dpid, link.src.dpid, {'port': link.dst.port_no}) for link in links_list]
         self.network.add_edges_from(links)
+        print("method get topology by switch event ")
+        print(self.network.number_of_nodes(), self.network.nodes)
+        print(self.network.number_of_edges(), self.network.edges)
 
     def get_out_port(self, src, dst, datapath, in_port):
         dpid = datapath.id
         # add link between host and ingress switch.
+        # 链路发现时，只能发现交换机，但是无法发现主机，主机的拓扑不存在
         if src not in self.network:
             self.network.add_node(src)
             self.network.add_edge(dpid, src, {'port': in_port})
@@ -173,6 +177,7 @@ class ExampleShortestForwarding(app_manager.RyuApp):
             next_hop = path[path.index(dpid) + 1]
             out_port = self.network[dpid][next_hop]['port']
         else:
+            # TODO 问题出在泛洪上
             out_port = datapath.ofproto.OFPP_FLOOD
 
         return out_port
