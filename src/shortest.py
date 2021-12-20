@@ -245,6 +245,19 @@ class ExampleShortestForwarding(app_manager.RyuApp):
             sum += item
         return sum / len(ls)
 
+    @staticmethod
+    def save_file(file_name=None, ls=None, mode='a'):
+        with open(file_name, mode=mode) as f:
+            for sub in ls:
+                st = ''
+                for i in range(len(sub)):
+                    if i != len(sub) - 1:
+                        st = (st + (str(sub[i]) + ','))
+                    else:
+                        st = st + (str(sub[i]))
+                f.write(st + '\r')
+            f.close()
+
     def get_delay_features(self):
         """
         get the delay in all port
@@ -265,5 +278,4 @@ class ExampleShortestForwarding(app_manager.RyuApp):
                     dst_echo_delay = self.echo_delay[dst_dpid]
                     port_delays.append((src_lldp_delay - (dst_echo_delay + src_echo_delay)) / 2)
             self.features.append([src_dpid, src_echo_delay, max(port_delays), min(port_delays), self.avg(port_delays)])
-        df = pd.DataFrame(self.features)
-        df.to_csv('./features.csv', sep=',', mode='a', index=None, header=False)
+        self.save_file(file_name='./features.csv', ls=self.features, mode='a')
