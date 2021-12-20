@@ -15,7 +15,7 @@ from ryu.lib import hub
 
 
 class ExampleShortestForwarding(app_manager.RyuApp):
-    """基于最短路径转发的程序模板"""
+    """shortest path exchange"""
 
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
@@ -23,30 +23,33 @@ class ExampleShortestForwarding(app_manager.RyuApp):
         super(ExampleShortestForwarding, self).__init__(*args, **kwargs)
         self.network = nx.DiGraph()
         self.topology_api_app = self
-        self.datapaths = {}  # 维护当前数据平面的所有交换机
+        self.datapaths = {}  # all switch set
         self.paths = {}
         self.features = []
-        self.echo_delay = {}  # 交换机与控制器之间的延时 {"dpid": "echoDelay"}
-        self.port_delay = {}  # 交换机各个端口的延时 {"dpid": {"port1": "portDelay"}}
+        # {'dpid': 20ms}
+        self.echo_delay = {}
+        self.port_delay = {}
         self.switches = lookup_service_brick('switches')
 
-        # 1. 开启一个线程, 定时探测并收集交换机端口的延迟和丢包率
         self.monitor_thread = hub.spawn(self._monitor)
 
     def _monitor(self):
-        """ 主动收集 SDN 数据平面的网络特征, 输出出现故障的交换机"""
+        """ get the features in data plane"""
         while True:
-            # 1. 流量收集阶段
-            print("下发 echo 报文")
-            self.send_echo_request()
-            hub.sleep(10)
-            print("查看当前收集到的特征")
+            while len(self.echo_delay) != len(self.datapaths):
+                print("wait all echo request finish")
+                print("echo: ", len(self.echo_delay))
+                print("dp: ", len(self.datapaths))
+                print("send echo request")
+                self.send_echo_request()
+                hub.sleep(10)
+            print("get the features in data plane")
             self.get_delay_features()
-            print("收集到的网络特征", self.features)
-            print("执行异常检测算法")
-            # # 2. 故障检测阶段
+            print(self.features)
+            print("execute the DL algorithm")
+            hub.sleep(10)
+
             # fault_dpid = self.fault_detection()
-            # # 3. 更新控制平面
             # del_flows = []
             # for dpid in self.network.predecessors(fault_dpid):
             #     del_flows.append((dpid, self.network[dpid][fault_dpid]['port']))
@@ -58,24 +61,24 @@ class ExampleShortestForwarding(app_manager.RyuApp):
             #         if fault_dpid not in ls:
             #             newpaths[src] = self.paths[src]
             # self.paths = newpaths
-            # # 4. 更新数据平面
             # hub.sleep(60)
 
     def send_echo_request(self):
         """
-        控制器向每个交换机发送 echo 报文, 并记录下发的时间戳
+        send echo request to all switches
         :return:
         """
         for datapath in self.datapaths.values():
             parser = datapath.ofproto_parser
-            echo_req = parser.OFPEchoRequest(datapath, data=bytes("%.12f" % time.time(), encoding="utf8"))
+            echo_req = parser.OFPEchoRequest(datapath, data=str("%.12f" % time.time()))
             datapath.send_msg(echo_req)
+            print("send a echo successful")
             hub.sleep(0.5)
 
     @set_ev_cls(ofp_event.EventOFPEchoReply, [MAIN_DISPATCHER, CONFIG_DISPATCHER, HANDSHAKE_DISPATCHER])
     def echo_reply_handler(self, ev):
         """
-        交换机向控制器的echo请求回应报文，收到此报文时，控制器通过当前时间-时间戳，计算出往返时延
+        reply the echo pkt from all switches
         :param ev:
         :return:
         """
@@ -83,20 +86,20 @@ class ExampleShortestForwarding(app_manager.RyuApp):
         try:
             delay = end_timestamp - eval(ev.msg.data)
             self.echo_delay[ev.msg.datapath.id] = delay
-            print("交换机: ", ev.msg.datapath.id, "与控制器之间的延时 ", delay)
+            print("switch: ", ev.msg.datapath.id, " and controller echo delay : ", delay)
         except Exception as error:
-            print("接收 echo 消息出现异常")
+            print("Exception in reply the echo pkt ")
             return
 
     def fault_detection(self):
-        """ 返回出现故障的交换机 id, 假设 s7"""
+        """ return the fault switch, such as s7"""
         return '0000000000000007'
 
     @set_ev_cls(ofp_event.EventOFPStateChange,
                 [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change_handler(self, ev):
         """
-            记录交换机状态
+            record the state of switch by datapaths
         """
         datapath = ev.datapath
         if ev.state == MAIN_DISPATCHER:
@@ -111,7 +114,7 @@ class ExampleShortestForwarding(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
         """
-        当控制器处于配置阶段时， 控制器发送自身特征，交换机响应自身信息。
+        controller send the table-miss pkt when the switch be in config stage.
         :param ev:
         :return:
         """
@@ -158,7 +161,6 @@ class ExampleShortestForwarding(app_manager.RyuApp):
     def get_out_port(self, src, dst, datapath, in_port):
         dpid = datapath.id
         # add link between host and ingress switch.
-        # 链路发现时，只能发现交换机，但是无法发现主机，主机的拓扑不存在
         if src not in self.network:
             self.network.add_node(src)
             self.network.add_edge(dpid, src, {'port': in_port})
@@ -177,7 +179,7 @@ class ExampleShortestForwarding(app_manager.RyuApp):
             next_hop = path[path.index(dpid) + 1]
             out_port = self.network[dpid][next_hop]['port']
         else:
-            # TODO 问题出在泛洪上
+            # TODO: a large pkts can't be abandoned in loop net because of the flood
             out_port = datapath.ofproto.OFPP_FLOOD
 
         return out_port
@@ -185,9 +187,8 @@ class ExampleShortestForwarding(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
         """
-        处理 packetIn 数据包的请求，包含两种情况:
-            1. lldp 数据包， 解析出指定交换机的端口的时间戳
-            2. 主机转发消息， 下发流表规则
+        lldp pkt: record the time interval by the start and end timestamp.
+        table-miss request: get the output port and send switch a flow table.
         :param ev:
         :return:
         """
@@ -204,7 +205,7 @@ class ExampleShortestForwarding(app_manager.RyuApp):
         dst = eth.dst
         src = eth.src
 
-        try:  # lldp 消息
+        try:  # lldp
             src_dpid, src_outport = LLDPPacket.lldp_parse(msg.data)
             dst_dpid = msg.datapath.id
             if self.switches is None:
@@ -215,12 +216,12 @@ class ExampleShortestForwarding(app_manager.RyuApp):
                     port_data = self.switches.ports[port]
                     start = port_data.timestamp
                     if start:
-                        delay = time.time() - start
+                        delay = time.time() - float(start)
+                        # save delay to the network topology
                         self.network[src_dpid][dst_dpid]['delay'] = delay
-                        # 将网络延时保存到网络拓扑上
-                        print("交换机: ", src_dpid, " 的端口 ", port, " 延时为: ", delay)
+                        # print("switch: ", src_dpid, " 'port ", port, " delay: ", delay)
 
-        except Exception as error:  # 处理主机转发消息
+        except Exception as error:  # table-miss
             out_port = self.get_out_port(eth.src, eth.dst, datapath, in_port)
             actions = [ofp_parser.OFPActionOutput(out_port)]
             # install flow_mod to avoid packet_in next time.
@@ -235,7 +236,7 @@ class ExampleShortestForwarding(app_manager.RyuApp):
             datapath.send_msg(out)
 
     def avg(self, ls):
-        """ 求 list 平均值 """
+        """ get avg in list """
         sum = 0
         for item in ls:
             sum += item
@@ -243,16 +244,21 @@ class ExampleShortestForwarding(app_manager.RyuApp):
 
     def get_delay_features(self):
         """
-        获取交换机各个端口的时延
+        get the delay in all port
         :return:
         """
+        self.features = []
         for datapath in self.datapaths.values():
             src_dpid = datapath.id
             src_echo_delay = self.echo_delay[src_dpid]
             port_delays = []
+            port_delays.append(src_echo_delay)  # ---
             for dst_dpid, edge in self.network[src_dpid].items():
                 if 'delay' in edge.keys():
-                    src_lldp_delay = edge['delay']
-                    dst_echo_delay = self.echo_delay[dst_dpid]
-                    port_delays.append(src_lldp_delay - (dst_echo_delay + src_echo_delay) / 2)
-            self.features.append([src_dpid, src_echo_delay, max(port_delays), min(port_delays), self.avg(port_delays)])
+                    port_delays.append(edge['delay'])
+            #         src_lldp_delay = edge['delay']
+            #         dst_echo_delay = self.echo_delay[dst_dpid]
+            #         port_delays.append(src_lldp_delay - (dst_echo_delay + src_echo_delay) / 2)
+            # self.features.append([src_dpid, src_echo_delay, max(port_delays), min(port_delays), self.avg(port_delays)])
+            self.features.append(port_delays)
+
