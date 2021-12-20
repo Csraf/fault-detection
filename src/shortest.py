@@ -1,5 +1,7 @@
 import time
 import networkx as nx
+import pandas as pd
+
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import MAIN_DISPATCHER, CONFIG_DISPATCHER, DEAD_DISPATCHER, HANDSHAKE_DISPATCHER
@@ -23,6 +25,7 @@ class ExampleShortestForwarding(app_manager.RyuApp):
         super(ExampleShortestForwarding, self).__init__(*args, **kwargs)
         self.network = nx.DiGraph()
         self.topology_api_app = self
+        self.detection_cycle = 10
         self.datapaths = {}  # all switch set
         self.paths = {}
         self.features = []
@@ -47,7 +50,7 @@ class ExampleShortestForwarding(app_manager.RyuApp):
             self.get_delay_features()
             print(self.features)
             print("execute the DL algorithm")
-            hub.sleep(10)
+            hub.sleep(self.detection_cycle)
 
             # fault_dpid = self.fault_detection()
             # del_flows = []
@@ -251,14 +254,16 @@ class ExampleShortestForwarding(app_manager.RyuApp):
         for datapath in self.datapaths.values():
             src_dpid = datapath.id
             src_echo_delay = self.echo_delay[src_dpid]
+            # reset echo delay
+            self.echo_delay[src_dpid] = self.detection_cycle
             port_delays = []
-            port_delays.append(src_echo_delay)  # ---
             for dst_dpid, edge in self.network[src_dpid].items():
                 if 'delay' in edge.keys():
-                    port_delays.append(edge['delay'])
-            #         src_lldp_delay = edge['delay']
-            #         dst_echo_delay = self.echo_delay[dst_dpid]
-            #         port_delays.append(src_lldp_delay - (dst_echo_delay + src_echo_delay) / 2)
-            # self.features.append([src_dpid, src_echo_delay, max(port_delays), min(port_delays), self.avg(port_delays)])
-            self.features.append(port_delays)
-
+                    src_lldp_delay = edge['delay']
+                    # reset port delay
+                    edge['delay'] = self.detection_cycle
+                    dst_echo_delay = self.echo_delay[dst_dpid]
+                    port_delays.append((src_lldp_delay - (dst_echo_delay + src_echo_delay)) / 2)
+            self.features.append([src_dpid, src_echo_delay, max(port_delays), min(port_delays), self.avg(port_delays)])
+        df = pd.DataFrame(self.features)
+        df.to_csv('./features.csv', sep=',', mode='a', index=None, header=False)
