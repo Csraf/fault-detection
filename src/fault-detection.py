@@ -13,57 +13,111 @@ from ryu.topology import event, switches
 from ryu.base.app_manager import lookup_service_brick
 from ryu.topology.api import get_switch, get_link
 from ryu.lib import hub
+from ryu.lib import dpid as dpid_lib
+from ryu.lib import stplib
+from ryu.app import simple_switch_13
 
 
-class ExampleShortestForwarding(app_manager.RyuApp):
-    """shortest path exchange"""
-
+class SimpleSwitch13(simple_switch_13):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+    _CONTEXTS = {'stplib': stplib.Stp}
 
     def __init__(self, *args, **kwargs):
-        super(ExampleShortestForwarding, self).__init__(*args, **kwargs)
+        super(SimpleSwitch13, self).__init__(*args, **kwargs)
+        self.mac_to_port = {}  # {'dpid':{'dst_mac': 'port'}}
+        self.stp = kwargs['stplib']
         self.network = nx.DiGraph()
         self.topology_api_app = self
         self.detection_cycle = 10
         self.datapaths = {}  # all switch set
-        self.paths = {}
         self.features = []
-        # {'dpid': 20ms}
-        self.echo_delay = {}
+        self.echo_delay = {}  # {'dpid': 20ms}
         self.port_delay = {}
         self.switches = lookup_service_brick('switches')
-
         self.monitor_thread = hub.spawn(self._monitor)
 
+        # Sample of stplib config.
+        #  please refer to stplib.Stp.set_config() for details.
+        config = {dpid_lib.str_to_dpid('0000000000000001'):
+                      {'bridge': {'priority': 0x8000}},
+                  dpid_lib.str_to_dpid('0000000000000002'):
+                      {'bridge': {'priority': 0x9000}},
+                  dpid_lib.str_to_dpid('0000000000000003'):
+                      {'bridge': {'priority': 0xa000}}}
+        self.stp.set_config(config)
+
     def _monitor(self):
+        """
+        execute the fault-detection algorithm for each 60s
+        :return:
+        """
         """ get the features in data plane"""
         while True:
-            while len(self.echo_delay) != len(self.datapaths) \
-                    and len(self.datapaths) != 0:
-                print("echo: ", len(self.echo_delay))
-                print("dp: ", len(self.datapaths))
-                print("send echo request")
-                self.send_echo_request()
-                hub.sleep(10)
+            print("send echo request ")
+            self.send_echo_request()
+            hub.sleep(30)
+
             print("get the features in data plane")
             self.get_delay_features()
             print(self.features)
-            print("execute the DL algorithm")
-            hub.sleep(self.detection_cycle)
 
-            # fault_dpid = self.fault_detection()
-            # del_flows = []
-            # for dpid in self.network.predecessors(fault_dpid):
-            #     del_flows.append((dpid, self.network[dpid][fault_dpid]['port']))
-            #
-            # self.network.remove_node(fault_dpid)
-            # newpaths = {}
-            # for src, ds in self.paths.items():
-            #     for dst, ls in ds.items():
-            #         if fault_dpid not in ls:
-            #             newpaths[src] = self.paths[src]
-            # self.paths = newpaths
-            # hub.sleep(60)
+            print("executing the fault detection algorithm")
+            fault_id = self.fault_detection()
+
+            if fault_id != None:
+                print("fault switch is : ", fault_id)
+                print("fault detection recover stage")
+                dp = self.datapaths[fault_id]
+
+                if dp.id in self.mac_to_port:
+                    print("data plane del the switch")
+                    self.delete_flow(dp)
+                    print("control plane del the switch")
+                    del self.mac_to_port[dp.id]
+
+            else:
+                print("data plane running normally")
+            hub.sleep(30)
+
+    def fault_detection(self):
+        res = {}
+        cnt = 0
+        fault_id = None
+        for sw in self.features:
+            dpid = sw[0]
+            for i in range(1, len(self.features)):
+                if sw[i] >= self.detection_cycle:
+                    cnt += sw[i]
+            res[dpid] = cnt
+        mx = max(res.values())
+        for k, v in res.items():
+            if v == mx:
+                fault_id = k
+                break
+        return fault_id
+
+    def add_flow(self, datapath, priority, match, actions):
+        ofproto = datapath.ofproto
+        ofp_parser = datapath.ofproto_parser
+
+        # construct flow_mod message and send it.
+        inst = [ofp_parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
+                                                 actions)]
+        mod = ofp_parser.OFPFlowMod(datapath=datapath, priority=priority,
+                                    match=match, instructions=inst)
+        datapath.send_msg(mod)
+
+    def delete_flow(self, datapath):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        for dst in self.mac_to_port[datapath.id].keys():
+            match = parser.OFPMatch(eth_dst=dst)
+            mod = parser.OFPFlowMod(
+                datapath, command=ofproto.OFPFC_DELETE,
+                out_port=ofproto.OFPP_ANY, out_group=ofproto.OFPG_ANY,
+                priority=1, match=match)
+            datapath.send_msg(mod)
 
     def send_echo_request(self):
         """
@@ -92,10 +146,6 @@ class ExampleShortestForwarding(app_manager.RyuApp):
         except Exception as error:
             print("Exception in reply the echo pkt ")
             return
-
-    def fault_detection(self):
-        """ return the fault switch, such as s7"""
-        return '0000000000000007'
 
     @set_ev_cls(ofp_event.EventOFPStateChange,
                 [MAIN_DISPATCHER, DEAD_DISPATCHER])
@@ -130,61 +180,27 @@ class ExampleShortestForwarding(app_manager.RyuApp):
                                               ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
 
-    def add_flow(self, datapath, priority, match, actions):
-        ofproto = datapath.ofproto
-        ofp_parser = datapath.ofproto_parser
+    @set_ev_cls(stplib.EventTopologyChange, MAIN_DISPATCHER)
+    def _topology_change_handler(self, ev):
+        dp = ev.dp
+        dpid_str = dpid_lib.dpid_to_str(dp.id)
+        msg = 'Receive topology change event. Flush MAC table.'
+        self.logger.debug("[dpid=%s] %s", dpid_str, msg)
 
-        # construct flow_mod message and send it.
-        inst = [ofp_parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
-                                                 actions)]
-        mod = ofp_parser.OFPFlowMod(datapath=datapath, priority=priority,
-                                    match=match, instructions=inst)
-        datapath.send_msg(mod)
+        if dp.id in self.mac_to_port:
+            self.delete_flow(dp)
+            del self.mac_to_port[dp.id]
 
-    @set_ev_cls(event.EventSwitchEnter, [CONFIG_DISPATCHER, MAIN_DISPATCHER])
-    def get_topology(self, ev):
-        # get switches and store them into self.network
-        switch_list = get_switch(self.topology_api_app, None)
-        switches = [switch.dp.id for switch in switch_list]
-        self.network.add_nodes_from(switches)
-
-        # get links and store them into self.network
-        links_list = get_link(self.topology_api_app, None)
-        links = [(link.src.dpid, link.dst.dpid, {'port': link.src.port_no}) for link in links_list]
-        self.network.add_edges_from(links)
-
-        # reverse link.
-        links = [(link.dst.dpid, link.src.dpid, {'port': link.dst.port_no}) for link in links_list]
-        self.network.add_edges_from(links)
-        print("method get topology by switch event ")
-        print(self.network.number_of_nodes(), self.network.nodes)
-        print(self.network.number_of_edges(), self.network.edges)
-
-    def get_out_port(self, src, dst, datapath, in_port):
-        dpid = datapath.id
-        # add link between host and ingress switch.
-        if src not in self.network:
-            self.network.add_node(src)
-            self.network.add_edge(dpid, src, {'port': in_port})
-            self.network.add_edge(src, dpid)
-            self.paths.setdefault(src, {})
-
-        if dst in self.network:
-            # if path is not existed, calculate it and save it.
-            if dst not in self.paths[src]:
-                path = nx.shortest_path(self.network, src, dst)
-                self.paths[src][dst] = path
-
-            # find out_port to next hop.
-            path = self.paths[src][dst]
-            print("path: ", path)
-            next_hop = path[path.index(dpid) + 1]
-            out_port = self.network[dpid][next_hop]['port']
-        else:
-            # TODO: a large pkts can't be abandoned in loop net because of the flood
-            out_port = datapath.ofproto.OFPP_FLOOD
-
-        return out_port
+    @set_ev_cls(stplib.EventPortStateChange, MAIN_DISPATCHER)
+    def _port_state_change_handler(self, ev):
+        dpid_str = dpid_lib.dpid_to_str(ev.dp.id)
+        of_state = {stplib.PORT_STATE_DISABLE: 'DISABLE',
+                    stplib.PORT_STATE_BLOCK: 'BLOCK',
+                    stplib.PORT_STATE_LISTEN: 'LISTEN',
+                    stplib.PORT_STATE_LEARN: 'LEARN',
+                    stplib.PORT_STATE_FORWARD: 'FORWARD'}
+        self.logger.debug("[dpid=%s][port=%d] state=%s",
+                          dpid_str, ev.port_no, of_state[ev.port_state])
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
@@ -197,7 +213,7 @@ class ExampleShortestForwarding(app_manager.RyuApp):
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
-        ofp_parser = datapath.ofproto_parser
+        parser = datapath.ofproto_parser
 
         dpid = datapath.id
         in_port = msg.match['in_port']
@@ -224,17 +240,31 @@ class ExampleShortestForwarding(app_manager.RyuApp):
                         # print("switch: ", src_dpid, " 'port ", port, " delay: ", delay)
 
         except Exception as error:  # table-miss
-            out_port = self.get_out_port(eth.src, eth.dst, datapath, in_port)
-            actions = [ofp_parser.OFPActionOutput(out_port)]
-            # install flow_mod to avoid packet_in next time.
+            self.mac_to_port.setdefault(dpid, {})
+
+            self.logger.info("packet in %s %s %s %s", dpid, src, dst, in_port)
+
+            # learn a mac address to avoid FLOOD next time.
+            self.mac_to_port[dpid][src] = in_port
+
+            if dst in self.mac_to_port[dpid]:
+                out_port = self.mac_to_port[dpid][dst]
+            else:
+                out_port = ofproto.OFPP_FLOOD
+
+            actions = [parser.OFPActionOutput(out_port)]
+
+            # install a flow to avoid packet_in next time
             if out_port != ofproto.OFPP_FLOOD:
-                match = ofp_parser.OFPMatch(in_port=in_port, eth_dst=eth.dst)
+                match = parser.OFPMatch(in_port=in_port, eth_dst=dst)
                 self.add_flow(datapath, 1, match, actions)
 
-            # send packet_out msg to flood packet.
-            out = ofp_parser.OFPPacketOut(
-                datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,
-                actions=actions)
+            data = None
+            if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+                data = msg.data
+
+            out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
+                                      in_port=in_port, actions=actions, data=data)
             datapath.send_msg(out)
 
     def avg(self, ls):
@@ -275,6 +305,6 @@ class ExampleShortestForwarding(app_manager.RyuApp):
                     # reset port delay
                     edge['delay'] = self.detection_cycle
                     dst_echo_delay = self.echo_delay[dst_dpid]
-                    port_delays.append(src_lldp_delay - (dst_echo_delay + src_echo_delay)/2)
+                    port_delays.append(src_lldp_delay - (dst_echo_delay + src_echo_delay) / 2)
             self.features.append([src_dpid, src_echo_delay, max(port_delays), min(port_delays), self.avg(port_delays)])
         self.save_file(file_name='./features.txt', ls=self.features, mode='a')
