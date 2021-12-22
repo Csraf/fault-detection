@@ -28,28 +28,44 @@ class ExampleShortestForwarding(app_manager.RyuApp):
         self.datapaths = {}  # all switch set
         self.paths = {}
         self.features = []
-        # {'dpid': 20ms}
-        self.echo_delay = {}
+        self.echo_delay = {}  # {'dpid': 'time'}
         self.port_delay = {}
         self.switches = lookup_service_brick('switches')
 
         self.monitor_thread = hub.spawn(self._monitor)
 
     def _monitor(self):
+        """
+        execute the fault-detection algorithm for each 60s
+        :return:
+        """
         """ get the features in data plane"""
         while True:
-            while len(self.echo_delay) != len(self.datapaths) \
-                    and len(self.datapaths) != 0:
-                print("echo: ", len(self.echo_delay))
-                print("dp: ", len(self.datapaths))
-                print("send echo request")
-                self.send_echo_request()
-                hub.sleep(10)
+            print("send echo request ")
+            self.send_echo_request()
+            hub.sleep(30)
+
             print("get the features in data plane")
             self.get_delay_features()
             print(self.features)
-            print("execute the DL algorithm")
-            hub.sleep(self.detection_cycle)
+
+            print("executing the fault detection algorithm")
+            fault_id = self.fault_detection()
+            print(fault_id)
+
+            # if fault_id != None:
+            #     print("fault detection is : ", fault_id)
+            #     print("fault detection recover stage")
+            #     dp = self.datapaths[fault_id]
+            #
+            #     if dp.id in self.mac_to_port:
+            #         print("data plane del the switch")
+            #         self.delete_flow(dp)
+            #         print("control plane del the switch")
+            #         del self.mac_to_port[dp.id]
+            #
+            # else:
+            #     print("data plane running normally")
 
             # fault_dpid = self.fault_detection()
             # del_flows = []
@@ -64,6 +80,24 @@ class ExampleShortestForwarding(app_manager.RyuApp):
             #             newpaths[src] = self.paths[src]
             # self.paths = newpaths
             # hub.sleep(60)
+            hub.sleep(30)
+
+    def fault_detection(self):
+        res = {}
+        cnt = 0
+        fault_id = None
+        for sw in self.features:
+            dpid = sw[0]
+            for i in range(1, len(self.features)):
+                if sw[i] >= self.detection_cycle:
+                    cnt += sw[i]
+            res[dpid] = cnt
+        mx = max(res.values())
+        for k, v in res.items():
+            if v == mx:
+                fault_id = k
+                break
+        return fault_id
 
     def send_echo_request(self):
         """
@@ -156,7 +190,7 @@ class ExampleShortestForwarding(app_manager.RyuApp):
         # reverse link.
         links = [(link.dst.dpid, link.src.dpid, {'port': link.dst.port_no}) for link in links_list]
         self.network.add_edges_from(links)
-        print("method get topology by switch event ")
+        print("network topology init in control plane")
         print(self.network.number_of_nodes(), self.network.nodes)
         print(self.network.number_of_edges(), self.network.edges)
 
@@ -266,8 +300,6 @@ class ExampleShortestForwarding(app_manager.RyuApp):
         for datapath in self.datapaths.values():
             src_dpid = datapath.id
             src_echo_delay = self.echo_delay[src_dpid]
-            # reset echo delay
-            self.echo_delay[src_dpid] = self.detection_cycle
             port_delays = []
             for dst_dpid, edge in self.network[src_dpid].items():
                 if 'delay' in edge.keys():
@@ -275,6 +307,6 @@ class ExampleShortestForwarding(app_manager.RyuApp):
                     # reset port delay
                     edge['delay'] = self.detection_cycle
                     dst_echo_delay = self.echo_delay[dst_dpid]
-                    port_delays.append(src_lldp_delay - (dst_echo_delay + src_echo_delay)/2)
+                    port_delays.append(src_lldp_delay - (dst_echo_delay + src_echo_delay) / 2)
             self.features.append([src_dpid, src_echo_delay, max(port_delays), min(port_delays), self.avg(port_delays)])
         self.save_file(file_name='./features.txt', ls=self.features, mode='a')
