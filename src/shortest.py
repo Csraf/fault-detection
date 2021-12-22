@@ -25,11 +25,11 @@ class ExampleShortestForwarding(app_manager.RyuApp):
         self.network = nx.DiGraph()
         self.topology_api_app = self
         self.detection_cycle = 10
-        self.datapaths = {}  # all switch set
-        self.paths = {}
         self.features = []
-        self.echo_delay = {}  # {'dpid': 'time'}
-        self.port_delay = {}
+        self.paths = {}       # {src_mac: {dst_mac: []}}
+        self.datapaths = {}   # {dpid: datapath}
+        self.echo_delay = {}  # {dpid: time}
+        self.port_delay = {}  # {dpid: {port: time}}
         self.switches = lookup_service_brick('switches')
 
         self.monitor_thread = hub.spawn(self._monitor)
@@ -41,20 +41,21 @@ class ExampleShortestForwarding(app_manager.RyuApp):
         """
         """ get the features in data plane"""
         while True:
+            hub.sleep(10)  # wait mininet start
             print("send echo request ")
             self.send_echo_request()
-            hub.sleep(30)
+            hub.sleep(20)  # wait pingall
 
             print("get the features in data plane")
             self.get_delay_features()
             print(self.features)
 
             print("executing the fault detection algorithm")
-            fault_id = self.fault_detection()
-            print(fault_id)
+            # fault_id = self.fault_detection()
+            # print("fault switch is : ", fault_id)
 
             # if fault_id != None:
-            #     print("fault detection is : ", fault_id)
+            #     print("fault switch is : ", fault_id)
             #     print("fault detection recover stage")
             #     dp = self.datapaths[fault_id]
             #
@@ -66,38 +67,24 @@ class ExampleShortestForwarding(app_manager.RyuApp):
             #
             # else:
             #     print("data plane running normally")
-
-            # fault_dpid = self.fault_detection()
-            # del_flows = []
-            # for dpid in self.network.predecessors(fault_dpid):
-            #     del_flows.append((dpid, self.network[dpid][fault_dpid]['port']))
-            #
-            # self.network.remove_node(fault_dpid)
-            # newpaths = {}
-            # for src, ds in self.paths.items():
-            #     for dst, ls in ds.items():
-            #         if fault_dpid not in ls:
-            #             newpaths[src] = self.paths[src]
-            # self.paths = newpaths
-            # hub.sleep(60)
             hub.sleep(30)
 
-    def fault_detection(self):
-        res = {}
-        cnt = 0
-        fault_id = None
-        for sw in self.features:
-            dpid = sw[0]
-            for i in range(1, len(self.features)):
-                if sw[i] >= self.detection_cycle:
-                    cnt += sw[i]
-            res[dpid] = cnt
-        mx = max(res.values())
-        for k, v in res.items():
-            if v == mx:
-                fault_id = k
-                break
-        return fault_id
+    # def fault_detection(self):
+    #     res = {}
+    #     cnt = 0
+    #     fault_id = None
+    #     for sw in self.features:
+    #         dpid = sw[0]
+    #         for i in range(1, len(self.features)):
+    #             if sw[i] >= self.detection_cycle:
+    #                 cnt += sw[i]
+    #         res[dpid] = cnt
+    #     mx = max(res.values())
+    #     for k, v in res.items():
+    #         if v == mx:
+    #             fault_id = k
+    #             break
+    #     return fault_id
 
     def send_echo_request(self):
         """
@@ -126,10 +113,6 @@ class ExampleShortestForwarding(app_manager.RyuApp):
         except Exception as error:
             print("Exception in reply the echo pkt ")
             return
-
-    def fault_detection(self):
-        """ return the fault switch, such as s7"""
-        return '0000000000000007'
 
     @set_ev_cls(ofp_event.EventOFPStateChange,
                 [MAIN_DISPATCHER, DEAD_DISPATCHER])
@@ -190,9 +173,7 @@ class ExampleShortestForwarding(app_manager.RyuApp):
         # reverse link.
         links = [(link.dst.dpid, link.src.dpid, {'port': link.dst.port_no}) for link in links_list]
         self.network.add_edges_from(links)
-        print("network topology init in control plane")
-        print(self.network.number_of_nodes(), self.network.nodes)
-        print(self.network.number_of_edges(), self.network.edges)
+        print("network topology init finish in control plane")
 
     def get_out_port(self, src, dst, datapath, in_port):
         dpid = datapath.id
@@ -300,13 +281,16 @@ class ExampleShortestForwarding(app_manager.RyuApp):
         for datapath in self.datapaths.values():
             src_dpid = datapath.id
             src_echo_delay = self.echo_delay[src_dpid]
+            # reset echo delay
+            # self.echo_delay[src_dpid] = self.detection_cycle
             port_delays = []
             for dst_dpid, edge in self.network[src_dpid].items():
                 if 'delay' in edge.keys():
                     src_lldp_delay = edge['delay']
                     # reset port delay
-                    edge['delay'] = self.detection_cycle
+                    # edge['delay'] = self.detection_cycle
                     dst_echo_delay = self.echo_delay[dst_dpid]
-                    port_delays.append(src_lldp_delay - (dst_echo_delay + src_echo_delay) / 2)
+                    # port_delays.append(src_lldp_delay - (dst_echo_delay + src_echo_delay)/2)
+                    port_delays.append(src_lldp_delay)
             self.features.append([src_dpid, src_echo_delay, max(port_delays), min(port_delays), self.avg(port_delays)])
         self.save_file(file_name='./features.txt', ls=self.features, mode='a')
